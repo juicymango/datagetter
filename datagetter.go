@@ -16,42 +16,28 @@ const (
 	DataGetterStateNotStarted DataGetterState = 0
 	// DataGetterStateStarted indicates that the DataGetter has started but not yet completed initialization.
 	DataGetterStateStarted DataGetterState = 1
-	// DataGetterStateDone indicates that the DataGetter has completed initialization (either successfully or with an error).
+	// DataGetterStateDone indicates that the DataGetter has completed initialization (whether successfully or not).
 	DataGetterStateDone DataGetterState = 2
 )
 
 // InitFunc is the function type for data initialization.
-// It receives a context.Context for handling timeouts and cancellations, and returns an error to indicate the result of the initialization.
+// It receives a context.Context for handling timeouts and cancellations,
+// and returns an error to indicate the result of the initialization.
 type InitFunc func(ctx context.Context) error
 
-// PanicHandler is a function type for handling panics that occur during initialization.
-// It receives the value from recover() and should return an error.
-type PanicHandler func(p any) error
-
 // DataGetter is a tool for managing data fetching and synchronization.
-// It ensures that data is initialized only once and can be safely shared across multiple goroutines.
-// This version supports error handling, context passing, and custom panic handling.
+// It ensures that data is initialized only once and can be safely shared among multiple goroutines.
+// The zero value of a DataGetter is ready to use.
 type DataGetter struct {
-	State        DataGetterState
-	SelfOnce     sync.Once
-	WaitDone     chan struct{}
-	WaitStarted  chan struct{}
-	InitErr      error // Stores the error from the initialization process (from InitFunc or a panic).
-	PanicHandler PanicHandler
+	State       DataGetterState
+	SelfOnce    sync.Once
+	WaitDone    chan struct{}
+	WaitStarted chan struct{}
+	InitErr     error
 }
 
-// NewDataGetter creates a new DataGetter instance.
-// You can optionally provide a custom PanicHandler.
-func NewDataGetter(handler ...PanicHandler) *DataGetter {
-	dg := &DataGetter{}
-	if len(handler) > 0 && handler[0] != nil {
-		dg.PanicHandler = handler[0]
-	}
-	return dg
-}
-
-// Start is used when the initialization process spans multiple functions, in conjunction with Done.
-// You must ensure that Done is called after Start.
+// Start is used for initialization processes that span across functions, used in conjunction with Done.
+// The user must ensure that Done is called after Start.
 func (d *DataGetter) Start() {
 	if !atomic.CompareAndSwapInt32(&d.State, DataGetterStateNotStarted, DataGetterStateStarted) {
 		return
@@ -60,14 +46,13 @@ func (d *DataGetter) Start() {
 	close(d.WaitStarted)
 }
 
-// Done is called after Start to indicate that the initialization has finished.
-// This version executes synchronously to ensure immediate state transition and avoid unnecessary goroutine overhead.
+// Done is called after Start to indicate that the initialization has ended.
+// This is a synchronous call to ensure the state transition is immediate.
 func (d *DataGetter) Done() {
-	// Since initFunc is nil, DoInit will complete the state transition immediately, so a synchronous call is safe.
 	d.DoInit(context.Background(), nil)
 }
 
-// AsyncInit initializes the data asynchronously.
+// AsyncInit initializes data asynchronously.
 // The initFunc will be executed in a new goroutine.
 func (d *DataGetter) AsyncInit(ctx context.Context, initFunc InitFunc) {
 	if !atomic.CompareAndSwapInt32(&d.State, DataGetterStateNotStarted, DataGetterStateStarted) {
@@ -79,24 +64,18 @@ func (d *DataGetter) AsyncInit(ctx context.Context, initFunc InitFunc) {
 }
 
 // InitAndGet initializes and gets the data.
-// If the data is already initialized, it returns the result immediately (which may be an error).
-// If the data is not yet initialized, it uses the initFunc to initialize it and waits for it to complete.
-// If the context is canceled during the wait, it will return context.Canceled.
+// If the data has already been initialized, it returns the result immediately (which may be an error).
+// If the data has not been initialized, it uses initFunc to initialize it and waits for completion.
+// If the context is canceled during the wait, it returns context.Canceled.
 func (d *DataGetter) InitAndGet(ctx context.Context, initFunc InitFunc) error {
-	// Fast path: if already done, return the result immediately.
 	if atomic.LoadInt32(&d.State) == DataGetterStateDone {
 		return d.InitErr
 	}
 
 	d.InitSelf()
 
-	// Try to become the initializer.
-	if atomic.CompareAndSwapInt32(&d.State, DataGetterStateNotStarted, DataGetterStateStarted) {
-		close(d.WaitStarted)
-		d.DoInit(ctx, initFunc)
-	}
+	d.AsyncInit(ctx, initFunc)
 
-	// Wait for initialization to complete or for the context to be canceled.
 	select {
 	case <-d.WaitDone:
 		return d.InitErr
@@ -106,23 +85,15 @@ func (d *DataGetter) InitAndGet(ctx context.Context, initFunc InitFunc) error {
 }
 
 // DoInit executes the initialization function. This is the internal core logic.
-// It handles panics, executes the initFunc, stores errors, and finally updates the state.
+// It handles panics, executes the initFunc, stores any resulting error, and updates the state.
 func (d *DataGetter) DoInit(ctx context.Context, initFunc InitFunc) {
-	// Use a defer to ensure that no matter what happens, the state transition and notification will be completed.
 	defer func() {
 		if r := recover(); r != nil {
-			if d.PanicHandler != nil {
-				// If there is a custom panic handler, use it.
-				d.InitErr = d.PanicHandler(r)
-			} else {
-				// Default handling: convert the panic to an error.
-				const size = 64 << 10
-				buf := make([]byte, size)
-				buf = buf[:runtime.Stack(buf, false)]
-				d.InitErr = fmt.Errorf("datagetter: panic recovered: %v\n%s", r, buf)
-			}
+			const size = 64 << 10
+			buf := make([]byte, size)
+			buf = buf[:runtime.Stack(buf, false)]
+			d.InitErr = fmt.Errorf("datagetter: panic recovered: %v\n%s", r, buf)
 		}
-		// Finally, complete the process.
 		atomic.StoreInt32(&d.State, DataGetterStateDone)
 		close(d.WaitDone)
 	}()
@@ -132,7 +103,8 @@ func (d *DataGetter) DoInit(ctx context.Context, initFunc InitFunc) {
 	}
 }
 
-// InitSelf initializes the DataGetter's own channels.
+// InitSelf initializes the channels within the DataGetter.
+// It's called by other methods to ensure the DataGetter is ready.
 func (d *DataGetter) InitSelf() {
 	d.SelfOnce.Do(func() {
 		d.WaitDone = make(chan struct{})
@@ -141,8 +113,7 @@ func (d *DataGetter) InitSelf() {
 }
 
 // CallStackWait waits for a series of DataGetters to complete initialization.
-// This function's logic remains unchanged because it is concerned with the state flow, not the error of the initialization result.
-// If the caller is concerned about the final result, it needs to call InitAndGet(ctx, nil) on the target DataGetter after CallStackWait returns.
+// This function is used to handle dependency chains.
 func CallStackWait(ctx context.Context, path []*DataGetter) {
 	if len(path) == 0 {
 		return
