@@ -24,7 +24,7 @@ func TestInitAndGet(t *testing.T) {
 		initFunc := func(ctx context.Context) error {
 			// Simulate work
 			time.Sleep(10 * time.Millisecond)
-			automic.AddInt32(&executionCount, 1)
+			atomic.AddInt32(&executionCount, 1)
 			return nil
 		}
 
@@ -215,7 +215,7 @@ func TestAsyncInit(t *testing.T) {
 
 	initFunc := func(ctx context.Context) error {
 		time.Sleep(50 * time.Millisecond)
-		automic.StoreInt32(&value, 100)
+		atomic.StoreInt32(&value, 100)
 		return nil
 	}
 
@@ -287,6 +287,11 @@ func TestCallStackWait(t *testing.T) {
 		getterA = DataGetter{}
 		getterB = DataGetter{}
 		getterC = DataGetter{}
+
+		// Pre-initialize the getters to create their internal channels.
+		getterA.InitSelf()
+		getterB.InitSelf()
+		getterC.InitSelf()
 		
 		path := []*DataGetter{&getterA, &getterB, &getterC}
 		
@@ -296,6 +301,10 @@ func TestCallStackWait(t *testing.T) {
 				runC(context.Background())
 			})
 		})
+
+		// Wait for the first getter to start to avoid a race condition where
+		// CallStackWait runs before the chain has even begun.
+		<-getterA.WaitStarted
 
 		// The consumer waits on the entire path.
 		CallStackWait(context.Background(), path)
@@ -316,12 +325,20 @@ func TestCallStackWait(t *testing.T) {
 		getterB = DataGetter{}
 		getterC = DataGetter{}
 
+		// Pre-initialize the getters to create their internal channels.
+		getterA.InitSelf()
+		getterB.InitSelf()
+		getterC.InitSelf()
+
 		path := []*DataGetter{&getterA, &getterB, &getterC}
 
 		// Run the partial chain (A -> B, but no C).
 		go runA(context.Background(), func() {
 			runB(context.Background(), nil) // B is called, but it doesn't call C.
 		})
+
+		// Wait for the first getter to start.
+		<-getterA.WaitStarted
 
 		// The consumer waits on the entire path.
 		CallStackWait(context.Background(), path)
