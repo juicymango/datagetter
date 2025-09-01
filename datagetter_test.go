@@ -242,71 +242,42 @@ func TestAsyncInit(t *testing.T) {
 // TestCallStackWait covers the complex scenarios involving dependency chains
 // where some dependencies may or may not be executed.
 func TestCallStackWait(t *testing.T) {
-	// Scenario: A consumer depends on a function C, which is part of a call chain A -> B -> C.
-	// The consumer needs to wait for C, but must not wait forever if the execution path
-	// skips C. CallStackWait solves this by allowing the consumer to wait on the entire
-	// potential call path.
-	
-	// Setup for the tests
-	var getterA, getterB, getterC DataGetter
-	
-	// Simulates the execution of function A
-	runA := func(ctx context.Context, runB func()) {
-		getterA.Start()
-		defer getterA.Done()
-		time.Sleep(10 * time.Millisecond)
-		if runB != nil {
-			runB()
-		}
-	}
-	
-	// Simulates the execution of function B
-	runB := func(ctx context.Context, runC func()) {
-		getterB.Start()
-		defer getterB.Done()
-		time.Sleep(10 * time.Millisecond)
-		if runC != nil {
-			runC()
-		}
-	}
-
-	// Simulates the execution of function C (the actual data producer)
-	runC := func(ctx context.Context) {
-		// Here we use InitAndGet which is equivalent to Start/Done for a self-contained function.
-		getterC.InitAndGet(ctx, func(ctx context.Context) error {
-			time.Sleep(10 * time.Millisecond)
-			return nil
-		})
-	}
+	// Scenario: A consumer depends on a result from an asynchronous function C,
+	// which is itself triggered by another asynchronous function B, which is
+	// triggered by a function A. (A -> B -> C).
+	// The consumer needs to wait for C, but must not wait forever if the execution
+	// path skips B or C. CallStackWait solves this by allowing the consumer to
+	// wait on the entire potential call path.
 
 	t.Run("Sub-Scenario: Dependency chain is fully executed", func(t *testing.T) {
-		// Here, we test the "happy path" where A calls B, and B calls C.
-		// The consumer waiting on the path [A, B, C] should wait until C is complete.
-		
-		// Reset getters for this sub-test
-		getterA = DataGetter{}
-		getterB = DataGetter{}
-		getterC = DataGetter{}
+		// Here, we test the "happy path" where A's init function triggers B's,
+		// and B's init function triggers C's. The consumer waiting on the
+		// path [A, B, C] should wait until C is complete.
+		var getterA, getterB, getterC DataGetter
 
-		// Pre-initialize the getters to create their internal channels.
-		getterA.InitSelf()
-		getterB.InitSelf()
-		getterC.InitSelf()
-		
+		initC := func(ctx context.Context) error {
+			time.Sleep(10 * time.Millisecond)
+			return nil
+		}
+
+		initB := func(ctx context.Context) error {
+			time.Sleep(10 * time.Millisecond)
+			// B triggers C's initialization.
+			getterC.AsyncInit(ctx, initC)
+			return nil
+		}
+
+		initA := func(ctx context.Context) error {
+			time.Sleep(10 * time.Millisecond)
+			// A triggers B's initialization.
+			getterB.AsyncInit(ctx, initB)
+			return nil
+		}
+
+		// Start the top-level initialization.
+		getterA.AsyncInit(context.Background(), initA)
+
 		path := []*DataGetter{&getterA, &getterB, &getterC}
-		
-		// Run the full chain in a separate goroutine.
-		go runA(context.Background(), func() {
-			runB(context.Background(), func() {
-				runC(context.Background())
-			})
-		})
-
-		// Wait for the first getter to start to avoid a race condition where
-		// CallStackWait runs before the chain has even begun.
-		<-getterA.WaitStarted
-
-		// The consumer waits on the entire path.
 		CallStackWait(context.Background(), path)
 
 		// After CallStackWait returns, C must be done.
@@ -316,31 +287,27 @@ func TestCallStackWait(t *testing.T) {
 	})
 
 	t.Run("Sub-Scenario: Dependency chain is partially executed (producer skipped)", func(t *testing.T) {
-		// Here, we test the critical case where A calls B, but B *does not* call C.
+		// Here, we test the critical case where A triggers B, but B *does not* trigger C.
 		// The consumer waiting on path [A, B, C] should stop waiting once B is complete,
-		// recognizing that C was skipped. It must not wait forever.
-		
-		// Reset getters for this sub-test
-		getterA = DataGetter{}
-		getterB = DataGetter{}
-		getterC = DataGetter{}
+		// recognizing that C was skipped.
+		var getterA, getterB, getterC DataGetter
 
-		// Pre-initialize the getters to create their internal channels.
-		getterA.InitSelf()
-		getterB.InitSelf()
-		getterC.InitSelf()
+		// C is never initialized in this test.
+		initB := func(ctx context.Context) error {
+			time.Sleep(10 * time.Millisecond)
+			// B completes without triggering C.
+			return nil
+		}
+
+		initA := func(ctx context.Context) error {
+			time.Sleep(10 * time.Millisecond)
+			getterB.AsyncInit(ctx, initB)
+			return nil
+		}
+
+		getterA.AsyncInit(context.Background(), initA)
 
 		path := []*DataGetter{&getterA, &getterB, &getterC}
-
-		// Run the partial chain (A -> B, but no C).
-		go runA(context.Background(), func() {
-			runB(context.Background(), nil) // B is called, but it doesn't call C.
-		})
-
-		// Wait for the first getter to start.
-		<-getterA.WaitStarted
-
-		// The consumer waits on the entire path.
 		CallStackWait(context.Background(), path)
 
 		// After CallStackWait returns, B should be done, but C should not have started.
@@ -354,24 +321,25 @@ func TestCallStackWait(t *testing.T) {
 
 	t.Run("Sub-Scenario: Context is canceled during wait", func(t *testing.T) {
 		// This test ensures that CallStackWait respects context cancellation.
-		// If the context is canceled, the wait should terminate immediately.
-		
-		// Reset getters for this sub-test
-		getterA = DataGetter{}
-		getterB = DataGetter{}
-		
-		path := []*DataGetter{&getterA, &getterB}
+		var getterA, getterB DataGetter
+
+		initB := func(ctx context.Context) error {
+			time.Sleep(200 * time.Millisecond)
+			return nil
+		}
+		initA := func(ctx context.Context) error {
+			getterB.AsyncInit(ctx, initB)
+			return nil
+		}
+
 		ctx, cancel := context.WithCancel(context.Background())
+		
+		// Start the long-running producer chain.
+		getterA.AsyncInit(context.Background(), initA)
 
-		// Start a long-running producer chain.
-		go runA(context.Background(), func() {
-			time.Sleep(200 * time.Millisecond) // Make sure it's still running when we check.
-			runB(context.Background(), nil)
-		})
-
-		// Start waiting in a separate goroutine so we can cancel it.
 		waitReturned := make(chan struct{})
 		go func() {
+			path := []*DataGetter{&getterA, &getterB}
 			CallStackWait(ctx, path)
 			close(waitReturned)
 		}()
@@ -380,13 +348,10 @@ func TestCallStackWait(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 		cancel()
 
-		// The wait should return very quickly after cancellation.
 		select {
-		case <-
-			waitReturned:
+		case <-waitReturned:
 			// Success
-		case <-
-			time.After(50 * time.Millisecond):
+		case <-time.After(50 * time.Millisecond):
 			t.Fatal("CallStackWait did not return promptly after context cancellation")
 		}
 	})
