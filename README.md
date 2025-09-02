@@ -2,34 +2,49 @@
 
 [![Go Report Card](https://goreportcard.com/badge/github.com/juicymango/datagetter)](https://goreportcard.com/report/github.com/juicymango/datagetter)
 [![GoDoc](https://godoc.org/github.com/juicymango/datagetter?status.svg)](https://godoc.org/github.com/juicymango/datagetter)
-[![Build Status](https://travis-ci.org/juicymango/datagetter.svg?branch=main)](https://travis-ci.org/juicymango/datagetter)
-[![Test Coverage](https://codecov.io/gh/juicymango/datagetter/branch/main/graph/badge.svg)](https://codecov.io/gh/juicymango/datagetter)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-DataGetter is a powerful and flexible Go package for managing data initialization and synchronization. It ensures that data is initialized only once and can be safely shared across multiple goroutines, even in complex, real-world scenarios.
+DataGetter is a lightweight, zero-dependency Go package that provides a robust mechanism for handling one-time data initialization in concurrent applications. It ensures that an initialization function is executed exactly once, even when called from multiple goroutines simultaneously.
 
 ## The Problem
 
-In large, concurrent applications, it's common to have data that is expensive to produce and is needed by multiple parts of the system. This often leads to complex and error-prone code to handle questions like:
+In many concurrent programs, you have a piece of data that is expensive to produce and is only produced once. All subsequent requests for the data should wait for the production to finish and then use the already produced data. This can lead to complex and error-prone boilerplate code involving mutexes, wait groups, and channels to handle the synchronization correctly.
 
-- Is the data already initialized?
-- What happens if multiple goroutines try to initialize the data at the same time?
-- How do we handle initialization failures?
-- How do we wait for data that is being initialized in another goroutine, especially when the initialization path is not guaranteed to be executed?
+DataGetter solves this problem by providing a simple and reusable tool to manage this "one-time initialization" pattern.
 
-DataGetter provides a robust and well-tested solution to these problems.
+## Features
+
+-   **Exactly-Once Execution**: Guarantees that an initialization function is called only once.
+-   **Goroutine-Safe**: Can be safely called from multiple goroutines.
+-   **Zero-Value Ready**: A `DataGetter` is ready to use from its zero value. No explicit initialization is needed.
+-   **Advanced Dependency Handling**: Provides `CallStackWait` to handle complex, optional dependency chains between multiple `DataGetter` instances.
+-   **Context Aware**: All waiting operations respect `context.Context` for cancellation and timeouts.
+-   **Panic Safe**: Recovers from panics within the initialization function and returns them as errors.
 
 ## Installation
 
-```bash
+```sh
 go get github.com/juicymango/datagetter
 ```
 
 ## Usage
 
-### Basic Usage: `InitAndGet`
+The common pattern is to embed a `DataGetter` within a struct, alongside the data it protects.
 
-The most common use case is to ensure a piece of data is initialized before using it. `InitAndGet` is perfect for this. It takes a context and an initialization function. The first time it's called, it will run the function, store the result (including any errors), and all subsequent calls will return the stored result.
+```go
+type MyService struct {
+    // data is the data being protected.
+    // It is only safe to access after the getter has completed.
+    data   string
+    getter DataGetter
+}
+```
+
+### Primary Usage (99% of cases)
+
+The most common use case is having a producer start an asynchronous initialization, while one or more consumers wait for it to complete.
+
+-   **Producer**: Calls `AsyncInit()` to start the initialization in a new goroutine.
+-   **Consumer**: Calls `InitAndGet(nil)` to block until initialization is complete.
 
 ```go
 package main
@@ -37,137 +52,124 @@ package main
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/juicymango/datagetter"
 )
 
+// Service holds the data and the DataGetter.
 type Service struct {
-	Data   string
-	Getter datagetter.DataGetter
+	importantData string
+	getter        datagetter.DataGetter
 }
 
-func (s *Service) InitializeData(ctx context.Context) error {
-	fmt.Println("Initializing data...")
-	time.Sleep(1 * time.Second)
-	s.Data = "This is the initialized data"
-	return nil
+// producer starts the data initialization process asynchronously.
+func (s *Service) producer(ctx context.Context) {
+	fmt.Println("Producer: Starting initialization...")
+	initFunc := func(ctx context.Context) error {
+		fmt.Println("InitFunc: Performing complex initialization...")
+		time.Sleep(100 * time.Millisecond)
+		s.importantData = "Hello, World!"
+		fmt.Println("InitFunc: Initialization complete.")
+		return nil
+	}
+	s.getter.AsyncInit(ctx, initFunc)
+}
+
+// consumer waits for the data to be initialized and then uses it.
+func (s *Service) consumer(id int) {
+	fmt.Printf("Consumer %d: Waiting for data...\n", id)
+	err := s.getter.InitAndGet(context.Background(), nil)
+	if err != nil {
+		fmt.Printf("Consumer %d: Failed to get data: %v\n", id, err)
+		return
+	}
+	// It is now safe to access the data.
+	fmt.Printf("Consumer %d: Successfully got data: '%s'\n", id, s.importantData)
 }
 
 func main() {
-	service := &Service{}
-	var wg sync.WaitGroup
+	myService := &Service{}
 
-	for i := 0; i < 5; i++ {
+	// The producer starts the process.
+	myService.producer(context.Background())
+
+	// Multiple consumers can now wait for the result.
+	var wg sync.WaitGroup
+	for i := 1; i <= 3; i++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			fmt.Printf("Goroutine %d trying to get data...\n", id)
-			err := service.Getter.InitAndGet(context.Background(), service.InitializeData)
-			if err != nil {
-				fmt.Printf("Goroutine %d failed: %v\n", id, err)
-				return
-			}
-			fmt.Printf("Goroutine %d got data: %s\n", id, service.Data)
+			myService.consumer(id)
 		}(i)
 	}
-
 	wg.Wait()
 }
 ```
 
-### Asynchronous Initialization: `AsyncInit`
+### Basic Usage
 
-If the initialization is slow and you don't need the data immediately, you can start the initialization in the background with `AsyncInit`. Later, you can use `InitAndGet` with a `nil` initialization function to wait for the result.
-
-```go
-// In one part of your application
-go service.Getter.AsyncInit(context.Background(), service.InitializeData)
-
-// In another part of your application, where you need the data
-err := service.Getter.InitAndGet(context.Background(), nil)
-if err != nil {
-    // Handle error
-}
-// Use service.Data
-```
-
-### Manual Control: `Start` and `Done`
-
-For complex initialization logic that spans multiple functions, you can use `Start` and `Done` to manually control the state of the `DataGetter`.
+If the consumer of the data is also the one responsible for initializing it, you can use `InitAndGet` directly with an `InitFunc`. `DataGetter` ensures that only the first caller will execute the function.
 
 ```go
-func DoSomething(getter *datagetter.DataGetter) {
-    getter.Start()
-    defer getter.Done()
+func (s *Service) consumerAndInitializer(id int) {
+	fmt.Printf("Goroutine %d: Attempting to initialize and get data...\n", id)
 
-    // ... complex logic ...
+	initFunc := func(ctx context.Context) error {
+		fmt.Printf("Goroutine %d: Running the init function!\n", id)
+		s.importantData = "initialized by the first caller"
+		return nil
+	}
+
+	err := s.getter.InitAndGet(context.Background(), initFunc)
+	if err != nil {
+		// handle error
+	}
+	fmt.Printf("Goroutine %d: Data is ready: '%s'\n", id, s.importantData)
 }
 ```
 
 ### Advanced Usage: `CallStackWait`
 
-In some complex scenarios, a consumer goroutine might depend on data that is initialized within a complex call stack in another goroutine, and the initialization is not guaranteed to happen. `CallStackWait` is designed for this situation.
+In complex applications, you may have a chain of initializations (e.g., function A initializes data needed by B, which initializes data for C). A consumer might only depend on C, but its initialization is optional. `CallStackWait` allows a consumer to wait for the entire chain, and it will correctly unblock if any part of the chain is skipped.
 
-It allows a consumer to wait for a chain of `DataGetter`s. The wait will proceed down the chain as long as the next `DataGetter` in the chain is started. If a `DataGetter` in the chain is not started (because that path in the code was not taken), the wait will stop at the last completed `DataGetter` in the chain.
+See the implementation in `datagetter_test.go` for a detailed example of this scenario.
 
-This prevents the consumer from waiting forever for something that will never happen.
+### Error Handling
+
+If the `InitFunc` returns an error, that error will be cached and returned to all current and future callers of `InitAndGet`. When you receive an error, you should assume the associated data is in an invalid or inconsistent state.
 
 ```go
-// In the producer goroutine
-func A(getterA, getterB, getterC *datagetter.DataGetter) {
-    getterA.Start()
-    defer getterA.Done()
-
-    B(getterB, getterC)
-}
-
-func B(getterB, getterC *datagetter.DataGetter) {
-    getterB.Start()
-    defer getterB.Done()
-
-    if someCondition {
-        C(getterC)
+initFunc := func(ctx context.Context) error {
+    // Attempt to get data, but fail.
+    err := errors.New("failed to connect to database")
+    if err != nil {
+        return err // Return before assigning to any shared state.
     }
+    // s.data = ...
+    return nil
 }
 
-func C(getterC *datagetter.DataGetter) {
-    getterC.Start()
-    defer getterC.Done()
-    // ... initialize data ...
-}
-
-// In the consumer goroutine
-func main() {
-    var getterA, getterB, getterC datagetter.DataGetter
-    
-    go A(&getterA, &getterB, &getterC)
-
-    // Wait for C, but if C is not called, wait for B to finish.
-    // If B is not called, wait for A to finish.
-    datagetter.CallStackWait(context.Background(), []*datagetter.DataGetter{&getterA, &getterB, &getterC})
-    
-    // Now it's safe to check the result of the initialization
+err := s.getter.InitAndGet(context.Background(), initFunc)
+if err != nil {
+    // Handle the error. Do not use the data.
+    fmt.Println(err)
 }
 ```
 
-## API Documentation
+## API Philosophy
 
-Full API documentation is available at [GoDoc](https://godoc.org/github.com/juicymango/datagetter).
+This package follows a specific design philosophy regarding its API:
 
-## Coding Style and Philosophy
+**All fields and methods are exported.**
 
-This package follows a specific coding style and philosophy:
+This provides you with the maximum freedom and flexibility to use `DataGetter` in ways that may not be covered by the standard examples. You can inspect the state, access the internal error, or build your own logic on top of the exported fields.
 
-*   **No private members:** All functions, structs, and constants are public.
-*   **Freedom and Responsibility:** We provide examples for how to use this package, and we are responsible for ensuring those examples work correctly. We also give you the freedom to use the package in other ways, but in those cases, you are responsible for ensuring your usage is correct.
-
-We believe this philosophy provides the best balance of guidance and flexibility.
+However, with this freedom comes responsibility. The usage patterns shown in this README and in the official test files are the recommended and officially supported ways to use this package. If you choose to use the exported fields in other ways, you are responsible for ensuring the correctness and safety of your implementation.
 
 ## Contributing
 
-We welcome contributions! Please see our [contributing guidelines](CONTRIBUTING.md) for more information.
+Contributions are welcome! Please feel free to open an issue or submit a pull request.
 
 ## License
 
